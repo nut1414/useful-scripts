@@ -399,14 +399,45 @@ class EPUBExtractor:
         """Find subchapter markers in HTML content"""
         # Look for patterns like:
         # <div class="start-4em"><p>１</p></div>
-        # <div class="start-4em"><p>２</p></div>
-        pattern = r'<div[^>]*class="start-4em"[^>]*>\s*<p[^>]*>([１２３４５６７８９０\d]+)</p>\s*</div>'
-        matches = list(re.finditer(pattern, html_content, re.IGNORECASE))
+        # <span class="gfont">１</span>
+        # <div class="start-8em"><p><span class="font-1em10 tcy">1</span></p></div>
         
         subchapters = []
-        for i, match in enumerate(matches):
+        
+        # Pattern 1: <div class="start-4em"><p>１</p></div>
+        pattern1 = r'<div[^>]*class="start-4em"[^>]*>\s*<p[^>]*>([１２３４５６７８９０\d]+)</p>\s*</div>'
+        matches1 = list(re.finditer(pattern1, html_content, re.IGNORECASE))
+        
+        # Pattern 2: <span class="gfont">１</span>
+        pattern2 = r'<span[^>]*class="gfont"[^>]*>([１２３４５６７８９０\d]+)</span>'
+        matches2 = list(re.finditer(pattern2, html_content, re.IGNORECASE))
+        
+        # Pattern 3: <p>　　　　<span class="gfont">１</span></p> (with indentation)
+        pattern3 = r'<p[^>]*>\s*　+\s*<span[^>]*class="gfont"[^>]*>([１２３４５６７８９０\d]+)</span>\s*</p>'
+        matches3 = list(re.finditer(pattern3, html_content, re.IGNORECASE))
+        
+        # Pattern 4: <div class="start-8em"><p><span class="font-1em10 tcy">1</span></p></div>
+        pattern4 = r'<div[^>]*class="start-8em"[^>]*>\s*<p[^>]*>\s*<span[^>]*class="font-1em10[^"]*"[^>]*>([１２３４５６７８９０\d]+)</span>\s*</p>\s*</div>'
+        matches4 = list(re.finditer(pattern4, html_content, re.IGNORECASE))
+        
+        # Combine all matches and sort by position
+        all_matches = []
+        for match in matches1:
+            all_matches.append(('pattern1', match))
+        for match in matches2:
+            all_matches.append(('pattern2', match))
+        for match in matches3:
+            all_matches.append(('pattern3', match))
+        for match in matches4:
+            all_matches.append(('pattern4', match))
+        
+        # Sort by start position
+        all_matches.sort(key=lambda x: x[1].start())
+        
+        # Process matches to create subchapters
+        for i, (pattern_type, match) in enumerate(all_matches):
             start_pos = match.start()
-            end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(html_content)
+            end_pos = all_matches[i + 1][1].start() if i + 1 < len(all_matches) else len(html_content)
             
             # Extract the number
             number_text = match.group(1)
@@ -418,12 +449,25 @@ class EPUBExtractor:
             for char in number_text:
                 converted_number += number_map.get(char, char)
             
+            # Skip if the number is not a valid subchapter number (e.g., not 1, 2, 3, etc.)
+            try:
+                chapter_num = int(converted_number)
+                if chapter_num < 1 or chapter_num > 50:  # Reasonable range for subchapters
+                    continue
+            except ValueError:
+                continue
+            
             subchapters.append({
                 'number': converted_number,
                 'start_pos': start_pos,
                 'end_pos': end_pos,
-                'content': html_content[start_pos:end_pos]
+                'content': html_content[start_pos:end_pos],
+                'pattern': pattern_type
             })
+        
+        # If we found subchapters, print debug info
+        if subchapters:
+            print(f"  Found {len(subchapters)} subchapters using patterns: {set(s['pattern'] for s in subchapters)}")
         
         return subchapters
 
