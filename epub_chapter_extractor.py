@@ -18,7 +18,7 @@ from html import unescape
 
 
 class EPUBExtractor:
-    def __init__(self, epub_path, output_dir):
+    def __init__(self, epub_path, output_dir, extract_subchapters=False, show_furigana=False):
         self.epub_path = Path(epub_path)
         self.output_dir = Path(output_dir)
         self.temp_dir = self.output_dir / "temp_extracted"
@@ -26,6 +26,8 @@ class EPUBExtractor:
         self.resources = {}
         self.source_dir = None  # Will hold the directory to work with
         self.is_extracted_folder = False
+        self.extract_subchapters = extract_subchapters
+        self.show_furigana = show_furigana
         
     def detect_input_type(self):
         """Detect if input is an EPUB file or an already extracted folder"""
@@ -198,8 +200,53 @@ class EPUBExtractor:
             print(f"Error parsing navigation file: {e}")
             return []
     
+    def process_furigana(self, html_content):
+        """Process furigana based on the show_furigana flag"""
+        if self.show_furigana:
+            # Convert <ruby>漢字<rt>かんじ</rt></ruby> to 漢字（かんじ）
+            def replace_ruby(match):
+                ruby_content = match.group(1)
+                # Extract kanji and furigana pairs
+                kanji_parts = []
+                furigana_parts = []
+                
+                # Split by <rt> tags to get kanji and furigana
+                parts = re.split(r'<rt>(.*?)</rt>', ruby_content)
+                for i in range(0, len(parts), 2):
+                    if i < len(parts):
+                        kanji_parts.append(parts[i])
+                    if i + 1 < len(parts):
+                        furigana_parts.append(parts[i + 1])
+                
+                # Combine kanji and furigana
+                kanji_text = ''.join(kanji_parts)
+                furigana_text = ''.join(furigana_parts)
+                
+                if furigana_text:
+                    return f"{kanji_text}（{furigana_text}）"
+                else:
+                    return kanji_text
+            
+            # Replace ruby tags with furigana in parentheses
+            html_content = re.sub(r'<ruby>(.*?)</ruby>', replace_ruby, html_content, flags=re.DOTALL)
+        else:
+            # Remove furigana, keep only kanji
+            def replace_ruby_kanji_only(match):
+                ruby_content = match.group(1)
+                # Remove all <rt>...</rt> tags to keep only kanji
+                kanji_only = re.sub(r'<rt>.*?</rt>', '', ruby_content)
+                return kanji_only
+            
+            # Replace ruby tags with kanji only
+            html_content = re.sub(r'<ruby>(.*?)</ruby>', replace_ruby_kanji_only, html_content, flags=re.DOTALL)
+        
+        return html_content
+    
     def html_to_text(self, html_content):
         """Convert HTML content to plain text"""
+        # Process furigana first
+        html_content = self.process_furigana(html_content)
+        
         # Remove script and style elements
         html_content = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
         html_content = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
@@ -236,8 +283,38 @@ class EPUBExtractor:
         filename = filename.strip('. ')
         return filename[:100]  # Limit length
     
+    def find_subchapters_in_html(self, html_content):
+        """Find subchapter markers in HTML content"""
+        # Look for patterns like:
+        # <div class="start-4em"><p>１</p></div>
+        # <div class="start-4em"><p>２</p></div>
+        pattern = r'<div[^>]*class="start-4em"[^>]*>\s*<p[^>]*>([１２３４５６７８９０\d]+)</p>\s*</div>'
+        matches = list(re.finditer(pattern, html_content, re.IGNORECASE))
+        
+        subchapters = []
+        for i, match in enumerate(matches):
+            start_pos = match.start()
+            end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(html_content)
+            
+            # Extract the number
+            number_text = match.group(1)
+            # Convert Japanese numbers to Arabic if needed
+            number_map = {'１': '1', '２': '2', '３': '3', '４': '4', '５': '5', 
+                         '６': '6', '７': '7', '８': '8', '９': '9', '０': '0'}
+            
+            converted_number = ''
+            for char in number_text:
+                converted_number += number_map.get(char, char)
+            
+            subchapters.append({
+                'number': converted_number,
+                'start_pos': start_pos,
+                'end_pos': end_pos,
+                'content': html_content[start_pos:end_pos]
+            })
+        
+        return subchapters
 
-    
     def create_chapter_text_files(self, chapter_markers):
         """Create text files for each chapter based on navigation markers"""
         print("Creating chapter text files...")
@@ -273,20 +350,83 @@ class EPUBExtractor:
             # Collect all files for this chapter
             chapter_files = self.get_chapter_files(start_file, next_start_file, spine_by_filename)
             
-            # Extract text content
-            chapter_text = self.extract_chapter_text(chapter_files)
-            
-            # Save to text file
-            title = self.sanitize_filename(marker['title'])
-            filename = f"Chapter_{i+1:02d}_{title}.txt"
-            output_file = self.output_dir / filename
-            
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(f"# {marker['title']}\n\n")
-                f.write(chapter_text)
-            
-            print(f"Created: {filename}")
+            if self.extract_subchapters:
+                # Create chapter folder and extract subchapters
+                self.extract_chapter_with_subchapters(chapter_files, marker, i + 1)
+            else:
+                # Extract text content as single file
+                chapter_text = self.extract_chapter_text(chapter_files)
+                
+                # Save to text file
+                title = self.sanitize_filename(marker['title'])
+                filename = f"Chapter_{i+1:02d}_{title}.txt"
+                output_file = self.output_dir / filename
+                
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(f"# {marker['title']}\n\n")
+                    f.write(chapter_text)
+                
+                print(f"Created: {filename}")
     
+    def extract_chapter_with_subchapters(self, chapter_files, marker, chapter_num):
+        """Extract a chapter with subchapters into separate files in a folder"""
+        title = self.sanitize_filename(marker['title'])
+        chapter_folder_name = f"Chapter_{chapter_num:02d}_{title}"
+        chapter_folder = self.output_dir / chapter_folder_name
+        chapter_folder.mkdir(parents=True, exist_ok=True)
+        
+        print(f"  Creating chapter folder: {chapter_folder_name}")
+        
+        # Combine all HTML content for this chapter
+        combined_html = ""
+        for file_item in chapter_files:
+            file_path = file_item["full_path"]
+            
+            if not file_path.exists():
+                print(f"  Warning: File not found: {file_path}")
+                continue
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    html_content = f.read()
+                    combined_html += html_content + "\n"
+            except Exception as e:
+                print(f"  Error reading file {file_path}: {e}")
+        
+        # Find subchapters in the combined HTML
+        subchapters = self.find_subchapters_in_html(combined_html)
+        
+        if subchapters:
+            print(f"  Found {len(subchapters)} subchapters")
+            
+            # Extract each subchapter
+            for j, subchapter in enumerate(subchapters):
+                subchapter_text = self.html_to_text(subchapter['content'])
+                
+                if subchapter_text.strip():
+                    subchapter_filename = f"[{subchapter['number']}] {chapter_folder_name}.txt"
+                    subchapter_file = chapter_folder / subchapter_filename
+                    
+                    with open(subchapter_file, 'w', encoding='utf-8') as f:
+                        f.write(f"# {marker['title']} - Part {subchapter['number']}\n\n")
+                        f.write(subchapter_text)
+                    
+                    print(f"    Created: {subchapter_filename}")
+        else:
+            # No subchapters found, create single file
+            print(f"  No subchapters found, creating single file")
+            chapter_text = self.html_to_text(combined_html)
+            
+            if chapter_text.strip():
+                main_filename = f"[1] {chapter_folder_name}.txt"
+                main_file = chapter_folder / main_filename
+                
+                with open(main_file, 'w', encoding='utf-8') as f:
+                    f.write(f"# {marker['title']}\n\n")
+                    f.write(chapter_text)
+                
+                print(f"    Created: {main_filename}")
+
     def get_chapter_files(self, start_file, next_start_file, spine_by_filename):
         """Get all files that belong to a chapter"""
         files = []
@@ -388,15 +528,24 @@ class EPUBExtractor:
         
         content = f"EPUB Chapters\n"
         content += f"Extracted from: {self.epub_path.name}\n"
-        content += f"Total chapters: {len(chapter_markers)}\n\n"
-        content += "=" * 50 + "\n\n"
+        content += f"Total chapters: {len(chapter_markers)}\n"
+        if self.extract_subchapters:
+            content += f"Extraction mode: Subchapters (folder per chapter)\n"
+        else:
+            content += f"Extraction mode: Single file per chapter\n"
+        content += "\n" + "=" * 50 + "\n\n"
         
         # Add list of chapters
         for i, marker in enumerate(chapter_markers, 1):
             title = self.sanitize_filename(marker['title'])
-            filename = f"Chapter_{i:02d}_{title}.txt"
-            content += f"Chapter {i}: {marker['title']}\n"
-            content += f"File: {filename}\n\n"
+            if self.extract_subchapters:
+                folder_name = f"Chapter_{i:02d}_{title}"
+                content += f"Chapter {i}: {marker['title']}\n"
+                content += f"Folder: {folder_name}/\n\n"
+            else:
+                filename = f"Chapter_{i:02d}_{title}.txt"
+                content += f"Chapter {i}: {marker['title']}\n"
+                content += f"File: {filename}\n\n"
         
         with open(index_path, 'w', encoding='utf-8') as f:
             f.write(content)
@@ -438,6 +587,8 @@ class EPUBExtractor:
             print(f"\nExtraction complete! Chapters saved to: {self.output_dir}")
             if chapter_markers:
                 print(f"Total chapters extracted: {len(chapter_markers)}")
+                if self.extract_subchapters:
+                    print("Each chapter is in its own folder with numbered subchapter files")
             else:
                 print(f"Total files extracted: {len([f for f in self.output_dir.iterdir() if f.suffix == '.txt'])}")
             
@@ -448,17 +599,102 @@ class EPUBExtractor:
             self.cleanup()
 
 
+def find_epub_files(directory, recursive=False):
+    """Find all EPUB files in a directory"""
+    directory = Path(directory)
+    epub_files = []
+    
+    if recursive:
+        epub_files = list(directory.rglob("*.epub"))
+    else:
+        epub_files = list(directory.glob("*.epub"))
+    
+    return sorted(epub_files)
+
+def bulk_extract_epubs(input_dir, output_dir, extract_subchapters=False, show_furigana=False, recursive=False):
+    """Extract multiple EPUB files from a directory"""
+    input_path = Path(input_dir)
+    output_path = Path(output_dir)
+    
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input directory not found: {input_path}")
+    
+    if not input_path.is_dir():
+        raise ValueError(f"Input path is not a directory: {input_path}")
+    
+    # Find all EPUB files
+    epub_files = find_epub_files(input_path, recursive)
+    
+    if not epub_files:
+        print(f"No EPUB files found in {input_path}")
+        return
+    
+    print(f"Found {len(epub_files)} EPUB file(s) to process")
+    
+    # Create main output directory
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    successful_extractions = 0
+    failed_extractions = 0
+    
+    for i, epub_file in enumerate(epub_files, 1):
+        print(f"\n{'='*60}")
+        print(f"Processing EPUB {i}/{len(epub_files)}: {epub_file.name}")
+        print(f"{'='*60}")
+        
+        # Create output subdirectory based on EPUB filename
+        epub_output_dir = output_path / epub_file.stem
+        
+        try:
+            extractor = EPUBExtractor(epub_file, epub_output_dir, extract_subchapters, show_furigana)
+            extractor.extract_chapters()
+            successful_extractions += 1
+            print(f"✓ Successfully extracted: {epub_file.name}")
+        except Exception as e:
+            failed_extractions += 1
+            print(f"✗ Failed to extract {epub_file.name}: {e}")
+            continue
+    
+    print(f"\n{'='*60}")
+    print(f"BULK EXTRACTION COMPLETE")
+    print(f"{'='*60}")
+    print(f"Total files processed: {len(epub_files)}")
+    print(f"Successful extractions: {successful_extractions}")
+    print(f"Failed extractions: {failed_extractions}")
+    print(f"Output directory: {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Extract EPUB chapters into separate folders")
-    parser.add_argument("epub_path", help="Path to the EPUB file or extracted EPUB folder")
+    parser.add_argument("epub_path", help="Path to the EPUB file, extracted EPUB folder, or directory containing EPUB files")
     parser.add_argument("-o", "--output", default="extracted_chapters", 
                        help="Output directory (default: extracted_chapters)")
+    parser.add_argument("--subchapters", action="store_true",
+                       help="Extract subchapters into separate files within chapter folders")
+    parser.add_argument("--furigana", action="store_true",
+                       help="Show furigana in parentheses format (e.g., 梓川咲太（あずさがわさくた）)")
+    parser.add_argument("--bulk", action="store_true",
+                       help="Process all EPUB files in the input directory (use with directory path)")
+    parser.add_argument("--recursive", action="store_true",
+                       help="Search for EPUB files recursively in subdirectories (use with --bulk)")
     
     args = parser.parse_args()
     
+    input_path = Path(args.epub_path)
+    
     try:
-        extractor = EPUBExtractor(args.epub_path, args.output)
-        extractor.extract_chapters()
+        # Check if bulk processing is requested or if input is a directory with EPUB files
+        if args.bulk or (input_path.is_dir() and not (input_path / "META-INF").exists()):
+            # Bulk processing mode
+            if not input_path.is_dir():
+                print(f"Error: Bulk processing requires a directory path, got: {input_path}")
+                return 1
+            
+            bulk_extract_epubs(args.epub_path, args.output, args.subchapters, args.furigana, args.recursive)
+        else:
+            # Single file/folder processing mode
+            extractor = EPUBExtractor(args.epub_path, args.output, args.subchapters, args.furigana)
+            extractor.extract_chapters()
     except Exception as e:
         print(f"Failed to extract EPUB: {e}")
         return 1
