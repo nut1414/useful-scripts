@@ -170,11 +170,19 @@ class EPUBExtractor:
         return chapters
     
     def parse_navigation_file(self, opf_path):
-        """Parse navigation file to get chapter boundaries (supports both navigation-documents.xhtml and toc.ncx)"""
+        """Parse navigation file to get chapter boundaries (supports navigation-documents.xhtml, nav.xhtml, and toc.ncx)"""
         base_dir = opf_path.parent
         chapter_markers = []
         
-        # Try navigation-documents.xhtml first (old format)
+        # Try nav.xhtml first (standard EPUB3 format)
+        nav_path = base_dir / "nav.xhtml"
+        if nav_path.exists():
+            print(f"Parsing navigation file: {nav_path}")
+            chapter_markers = self._parse_navigation_xhtml(nav_path)
+            if chapter_markers:
+                return chapter_markers
+        
+        # Try navigation-documents.xhtml (old format)
         nav_path = base_dir / "navigation-documents.xhtml"
         if not nav_path.exists():
             # Check in item subdirectory for old format
@@ -186,7 +194,7 @@ class EPUBExtractor:
             if chapter_markers:
                 return chapter_markers
         
-        # Try toc.ncx (new format)
+        # Try toc.ncx (alternative format)
         toc_path = base_dir / "toc.ncx"
         if toc_path.exists():
             print(f"Parsing toc.ncx file: {toc_path}")
@@ -234,8 +242,12 @@ class EPUBExtractor:
                         else:
                             file_part, anchor = href, None
                         
+                        # Remove OEBPS/ prefix if present for consistency
+                        if file_part.startswith('OEBPS/'):
+                            file_part = file_part[6:]
+                        
                         # Skip non-chapter items (cover, toc, etc.)
-                        if any(x in text.lower() for x in ['表紙', '目次', '奥付', 'cover', 'toc']):
+                        if any(x in text.lower() for x in ['表紙', '目次', '奥付', 'cover', 'toc', 'contents']):
                             continue
                         
                         chapter_markers.append({
@@ -245,7 +257,7 @@ class EPUBExtractor:
                             'href': href
                         })
             
-            print(f"Found {len(chapter_markers)} chapter markers from navigation-documents.xhtml")
+            print(f"Found {len(chapter_markers)} chapter markers from navigation file")
             return chapter_markers
             
         except Exception as e:
@@ -700,7 +712,7 @@ class EPUBExtractor:
 
 
 def find_epub_files(directory, recursive=False):
-    """Find all EPUB files in a directory"""
+    """Find all EPUB files in a directory, ignoring hidden files that start with '.'"""
     directory = Path(directory)
     epub_files = []
     
@@ -708,6 +720,9 @@ def find_epub_files(directory, recursive=False):
         epub_files = list(directory.rglob("*.epub"))
     else:
         epub_files = list(directory.glob("*.epub"))
+    
+    # Filter out files that start with "." (hidden files, macOS metadata files, etc.)
+    epub_files = [f for f in epub_files if not f.name.startswith('.')]
     
     return sorted(epub_files)
 
