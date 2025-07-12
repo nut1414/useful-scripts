@@ -83,7 +83,18 @@ class EPUBExtractor:
                 if opf_path:
                     return self.source_dir / opf_path
         
-        # Fallback: search for .opf files
+        # Fallback: search for .opf files in common locations
+        # Check for content.opf in root (new format)
+        content_opf_root = self.source_dir / "content.opf"
+        if content_opf_root.exists():
+            return content_opf_root
+            
+        # Check for standard.opf in item directory (old format)
+        standard_opf = self.source_dir / "item" / "standard.opf"
+        if standard_opf.exists():
+            return standard_opf
+        
+        # General fallback: search for any .opf files
         for opf_file in self.source_dir.rglob("*.opf"):
             return opf_file
         
@@ -107,10 +118,32 @@ class EPUBExtractor:
             media_type = item.get("media-type")
             
             if item_id and href:
+                # Handle relative paths correctly for both formats
+                if href.startswith("OEBPS/") or href.startswith("item/"):
+                    # Path already includes subdirectory
+                    full_path = base_dir / href
+                else:
+                    # Check if the file exists in common subdirectories
+                    possible_paths = [
+                        base_dir / href,  # Direct path from OPF directory
+                        base_dir / "OEBPS" / href,  # New format
+                        base_dir / "item" / "xhtml" / href,  # Old format
+                    ]
+                    
+                    full_path = None
+                    for path in possible_paths:
+                        if path.exists():
+                            full_path = path
+                            break
+                    
+                    # If not found, use the first possibility (direct path)
+                    if full_path is None:
+                        full_path = possible_paths[0]
+                
                 manifest_items[item_id] = {
                     "href": href,
                     "media_type": media_type,
-                    "full_path": base_dir / href
+                    "full_path": full_path
                 }
         
         # Find spine items (reading order)
@@ -137,16 +170,35 @@ class EPUBExtractor:
         return chapters
     
     def parse_navigation_file(self, opf_path):
-        """Parse navigation-documents.xhtml to get chapter boundaries"""
+        """Parse navigation file to get chapter boundaries (supports both navigation-documents.xhtml and toc.ncx)"""
         base_dir = opf_path.parent
+        chapter_markers = []
+        
+        # Try navigation-documents.xhtml first (old format)
         nav_path = base_dir / "navigation-documents.xhtml"
-        
         if not nav_path.exists():
-            print("Warning: navigation-documents.xhtml not found, using all spine items")
-            return []
+            # Check in item subdirectory for old format
+            nav_path = base_dir / "item" / "navigation-documents.xhtml"
         
-        print(f"Parsing navigation file: {nav_path}")
+        if nav_path.exists():
+            print(f"Parsing navigation file: {nav_path}")
+            chapter_markers = self._parse_navigation_xhtml(nav_path)
+            if chapter_markers:
+                return chapter_markers
         
+        # Try toc.ncx (new format)
+        toc_path = base_dir / "toc.ncx"
+        if toc_path.exists():
+            print(f"Parsing toc.ncx file: {toc_path}")
+            chapter_markers = self._parse_toc_ncx(toc_path, base_dir)
+            if chapter_markers:
+                return chapter_markers
+        
+        print("Warning: No navigation file found, using all spine items")
+        return []
+    
+    def _parse_navigation_xhtml(self, nav_path):
+        """Parse navigation-documents.xhtml file"""
         try:
             tree = ET.parse(nav_path)
             root = tree.getroot()
@@ -193,11 +245,59 @@ class EPUBExtractor:
                             'href': href
                         })
             
-            print(f"Found {len(chapter_markers)} chapter markers")
+            print(f"Found {len(chapter_markers)} chapter markers from navigation-documents.xhtml")
             return chapter_markers
             
         except Exception as e:
             print(f"Error parsing navigation file: {e}")
+            return []
+    
+    def _parse_toc_ncx(self, toc_path, base_dir):
+        """Parse toc.ncx file"""
+        try:
+            tree = ET.parse(toc_path)
+            root = tree.getroot()
+            
+            # Find all navPoints
+            namespace = {'ncx': 'http://www.daisy.org/z3986/2005/ncx/'}
+            chapter_markers = []
+            
+            for nav_point in root.findall(".//ncx:navPoint", namespace):
+                # Get the title
+                nav_label = nav_point.find(".//ncx:navLabel/ncx:text", namespace)
+                content = nav_point.find(".//ncx:content", namespace)
+                
+                if nav_label is not None and content is not None:
+                    title = nav_label.text
+                    src = content.get("src")
+                    
+                    if title and src:
+                        # Extract filename and anchor
+                        if '#' in src:
+                            file_part, anchor = src.split('#', 1)
+                        else:
+                            file_part, anchor = src, None
+                        
+                        # Remove OEBPS/ prefix if present for consistency
+                        if file_part.startswith('OEBPS/'):
+                            file_part = file_part[6:]
+                        
+                        # Skip non-chapter items
+                        if any(x in title.lower() for x in ['表紙', '目次', '奥付', 'cover', 'toc', 'contents']):
+                            continue
+                        
+                        chapter_markers.append({
+                            'title': title.strip(),
+                            'file': file_part,
+                            'anchor': anchor,
+                            'href': src
+                        })
+            
+            print(f"Found {len(chapter_markers)} chapter markers from toc.ncx")
+            return chapter_markers
+            
+        except Exception as e:
+            print(f"Error parsing toc.ncx file: {e}")
             return []
     
     def process_furigana(self, html_content):
@@ -612,7 +712,7 @@ def find_epub_files(directory, recursive=False):
     return sorted(epub_files)
 
 def bulk_extract_epubs(input_dir, output_dir, extract_subchapters=False, show_furigana=False, recursive=False):
-    """Extract multiple EPUB files from a directory"""
+    """Extract multiple EPUB files from a directory, preserving directory structure"""
     input_path = Path(input_dir)
     output_path = Path(output_dir)
     
@@ -642,8 +742,20 @@ def bulk_extract_epubs(input_dir, output_dir, extract_subchapters=False, show_fu
         print(f"Processing EPUB {i}/{len(epub_files)}: {epub_file.name}")
         print(f"{'='*60}")
         
-        # Create output subdirectory based on EPUB filename
-        epub_output_dir = output_path / epub_file.stem
+        # Calculate relative path from input directory to preserve structure
+        relative_path = epub_file.relative_to(input_path)
+        
+        # Create output path preserving the directory structure
+        # Remove the .epub extension from the filename and use it as the final folder name
+        epub_folder_name = epub_file.stem
+        
+        # If the EPUB is in a subdirectory, preserve that structure
+        if relative_path.parent != Path('.'):
+            # Create: output_dir/series_folder/epub_name/
+            epub_output_dir = output_path / relative_path.parent / epub_folder_name
+        else:
+            # Create: output_dir/epub_name/
+            epub_output_dir = output_path / epub_folder_name
         
         try:
             extractor = EPUBExtractor(epub_file, epub_output_dir, extract_subchapters, show_furigana)
