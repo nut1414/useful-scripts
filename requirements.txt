@@ -1,0 +1,14 @@
+# EPUB Chapter Extractor Requirements
+# All dependencies are part of Python's standard library
+# No additional packages needed
+
+# This file is provided for completeness
+# The script uses only standard library modules:
+# - zipfile
+# - xml.etree.ElementTree
+# - shutil
+# - argparse
+# - pathlib
+# - re
+# - urllib.parse
+# - html (for unescape function) 
