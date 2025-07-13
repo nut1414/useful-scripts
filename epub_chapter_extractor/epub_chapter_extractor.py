@@ -202,6 +202,12 @@ class EPUBExtractor:
             if chapter_markers:
                 return chapter_markers
         
+        # Fallback: Try to find embedded table of contents in content files
+        print("Standard navigation files didn't provide chapter structure, searching for embedded TOC...")
+        chapter_markers = self._parse_embedded_toc(base_dir)
+        if chapter_markers:
+            return chapter_markers
+        
         print("Warning: No navigation file found, using all spine items")
         return []
     
@@ -311,6 +317,188 @@ class EPUBExtractor:
         except Exception as e:
             print(f"Error parsing toc.ncx file: {e}")
             return []
+
+    def _parse_embedded_toc(self, base_dir):
+        """Parse embedded table of contents from content files"""
+        try:
+            chapter_markers = []
+            
+            # Look through spine items for potential TOC files
+            for item in self.spine_items:
+                if item["media_type"] in ["application/xhtml+xml", "text/html"]:
+                    file_path = item["full_path"]
+                    
+                    if not file_path.exists():
+                        continue
+                    
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        
+                        # Look for files that contain "CONTENTS" or multiple chapter links
+                        if 'CONTENTS' in content or self._has_chapter_links(content):
+                            print(f"Found potential embedded TOC in: {file_path.name}")
+                            markers = self._extract_chapter_links(content, base_dir)
+                            if markers:
+                                chapter_markers.extend(markers)
+                    
+                    except Exception as e:
+                        print(f"Error reading file {file_path}: {e}")
+                        continue
+            
+            # Remove duplicates and sort by file order in spine
+            if chapter_markers:
+                chapter_markers = self._deduplicate_and_sort_markers(chapter_markers)
+                print(f"Found {len(chapter_markers)} chapter markers from embedded TOC")
+            
+            return chapter_markers
+            
+        except Exception as e:
+            print(f"Error parsing embedded TOC: {e}")
+            return []
+    
+    def _has_chapter_links(self, content):
+        """Check if content has multiple chapter-like links"""
+        import re
+        
+        # Look for links with chapter-like text
+        chapter_patterns = [
+            r'<a[^>]*href="[^"]*"[^>]*>[^<]*(?:第[一二三四五六七八九十\d]+章|Chapter\s*\d+|プロローグ|エピローグ|あとがき)',
+            r'<a[^>]*href="[^"]*"[^>]*>[^<]*(?:章|chapter|prologue|epilogue)',
+        ]
+        
+        chapter_count = 0
+        for pattern in chapter_patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            chapter_count += len(matches)
+        
+        return chapter_count >= 3  # At least 3 chapter-like links
+    
+    def _extract_chapter_links(self, content, base_dir):
+        """Extract chapter links from HTML content"""
+        import re
+        from xml.etree import ElementTree as ET
+        
+        try:
+            # Parse as XML/HTML to extract links
+            # Remove doctype and other problematic elements for parsing
+            clean_content = re.sub(r'<!DOCTYPE[^>]*>', '', content)
+            
+            # Parse the content
+            root = ET.fromstring(clean_content)
+            
+            chapter_markers = []
+            
+            # Find all links
+            for link in root.iter():
+                if link.tag.endswith('a'):  # Handle namespaced tags
+                    href = link.get('href')
+                    text = ''.join(link.itertext()).strip()
+                    
+                    if href and text and self._is_chapter_link(text):
+                        # Extract filename and anchor
+                        if '#' in href:
+                            file_part, anchor = href.split('#', 1)
+                        else:
+                            file_part, anchor = href, None
+                        
+                        # Handle relative paths
+                        if file_part.startswith('OEBPS/'):
+                            file_part = file_part[6:]  # Remove OEBPS/ prefix
+                        
+                        chapter_markers.append({
+                            'title': text.strip(),
+                            'file': file_part,
+                            'anchor': anchor,
+                            'href': href
+                        })
+            
+            return chapter_markers
+            
+        except Exception as e:
+            print(f"Error extracting chapter links: {e}")
+            # Fallback to regex parsing
+            return self._extract_chapter_links_regex(content)
+    
+    def _extract_chapter_links_regex(self, content):
+        """Fallback regex-based chapter link extraction"""
+        import re
+        
+        chapter_markers = []
+        
+        # Pattern to match chapter links
+        link_pattern = r'<a[^>]*href="([^"]*)"[^>]*>([^<]*)</a>'
+        matches = re.findall(link_pattern, content, re.IGNORECASE)
+        
+        for href, text in matches:
+            text = text.strip()
+            if self._is_chapter_link(text):
+                # Extract filename and anchor
+                if '#' in href:
+                    file_part, anchor = href.split('#', 1)
+                else:
+                    file_part, anchor = href, None
+                
+                # Handle relative paths
+                if file_part.startswith('OEBPS/'):
+                    file_part = file_part[6:]  # Remove OEBPS/ prefix
+                
+                chapter_markers.append({
+                    'title': text.strip(),
+                    'file': file_part,
+                    'anchor': anchor,
+                    'href': href
+                })
+        
+        return chapter_markers
+    
+    def _is_chapter_link(self, text):
+        """Check if link text represents a chapter"""
+        if not text:
+            return False
+        
+        # Skip common non-chapter items
+        skip_items = ['表紙', '目次', '奥付', 'cover', 'toc', 'contents', '解説']
+        if any(skip in text.lower() for skip in skip_items):
+            return False
+        
+        # Look for chapter-like patterns
+        chapter_patterns = [
+            r'第[一二三四五六七八九十\d]+章',  # Japanese chapters
+            r'Chapter\s*\d+',                 # English chapters
+            r'プロローグ',                     # Prologue
+            r'エピローグ',                     # Epilogue  
+            r'あとがき',                       # Afterword
+            r'終\s*章',                       # Final chapter
+            r'[一二三四五六七八九十\d]+章',     # Chapters without 第
+        ]
+        
+        for pattern in chapter_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+        
+        return False
+    
+    def _deduplicate_and_sort_markers(self, markers):
+        """Remove duplicates and sort markers by spine order"""
+        seen = set()
+        unique_markers = []
+        
+        for marker in markers:
+            key = (marker['file'], marker.get('anchor', ''))
+            if key not in seen:
+                seen.add(key)
+                unique_markers.append(marker)
+        
+        # Sort by spine order if possible
+        spine_order = {Path(item['href']).name: i for i, item in enumerate(self.spine_items)}
+        
+        def sort_key(marker):
+            filename = marker['file']
+            return spine_order.get(filename, 999)
+        
+        unique_markers.sort(key=sort_key)
+        return unique_markers
     
     def process_furigana(self, html_content):
         """Process furigana based on the show_furigana flag"""
@@ -401,6 +589,7 @@ class EPUBExtractor:
         # <div class="start-4em"><p>１</p></div>
         # <span class="gfont">１</span>
         # <div class="start-8em"><p><span class="font-1em10 tcy">1</span></p></div>
+        # <p>　　　　１</p> (Japanese style with full-width spaces)
         
         subchapters = []
         
@@ -420,6 +609,10 @@ class EPUBExtractor:
         pattern4 = r'<div[^>]*class="start-8em"[^>]*>\s*<p[^>]*>\s*<span[^>]*class="font-1em10[^"]*"[^>]*>([１２３４５６７８９０\d]+)</span>\s*</p>\s*</div>'
         matches4 = list(re.finditer(pattern4, html_content, re.IGNORECASE))
         
+        # Pattern 5: <p>　　　　１</p> (Japanese style with full-width spaces and direct number)
+        pattern5 = r'<p[^>]*>\s*　{2,}\s*([１２３４５６７８９０\d]+)\s*</p>'
+        matches5 = list(re.finditer(pattern5, html_content, re.IGNORECASE))
+        
         # Combine all matches and sort by position
         all_matches = []
         for match in matches1:
@@ -430,6 +623,8 @@ class EPUBExtractor:
             all_matches.append(('pattern3', match))
         for match in matches4:
             all_matches.append(('pattern4', match))
+        for match in matches5:
+            all_matches.append(('pattern5', match))
         
         # Sort by start position
         all_matches.sort(key=lambda x: x[1].start())

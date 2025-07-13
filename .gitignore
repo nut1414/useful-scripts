@@ -1,2 +1,5 @@
 *.epub
 test
+
+.DS_Store
+.vscode
