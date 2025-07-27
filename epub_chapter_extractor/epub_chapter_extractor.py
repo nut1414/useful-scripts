@@ -15,10 +15,11 @@ from pathlib import Path
 import re
 from urllib.parse import unquote
 from html import unescape
+import math
 
 
 class EPUBExtractor:
-    def __init__(self, epub_path, output_dir, extract_subchapters=False, show_furigana=False):
+    def __init__(self, epub_path, output_dir, extract_subchapters=False, show_furigana=False, split_no_subchapters=False):
         self.epub_path = Path(epub_path)
         self.output_dir = Path(output_dir)
         self.temp_dir = self.output_dir / "temp_extracted"
@@ -28,6 +29,7 @@ class EPUBExtractor:
         self.is_extracted_folder = False
         self.extract_subchapters = extract_subchapters
         self.show_furigana = show_furigana
+        self.split_no_subchapters = split_no_subchapters
         
     def detect_input_type(self):
         """Detect if input is an EPUB file or an already extracted folder"""
@@ -662,9 +664,76 @@ class EPUBExtractor:
         
         # If we found subchapters, print debug info
         if subchapters:
+            # Adjust first subchapter to include any content before its marker
+            first_subchapter_marker_pos = all_matches[0][1].start()
+            if first_subchapter_marker_pos > 0:
+                first_subchapter_end_pos = subchapters[0]['end_pos']
+                subchapters[0]['content'] = html_content[0:first_subchapter_end_pos]
+                subchapters[0]['start_pos'] = 0
+                
             print(f"  Found {len(subchapters)} subchapters using patterns: {set(s['pattern'] for s in subchapters)}")
         
         return subchapters
+
+    def split_and_save_text(self, text_content, output_folder, file_prefix, chapter_title):
+        """Splits text into manageable chunks and saves them."""
+        CHUNK_SIZE = 15000  # Target size in characters
+        
+        total_len = len(text_content)
+        num_chunks = math.ceil(total_len / CHUNK_SIZE)
+        
+        if num_chunks <= 1:
+            # This case should ideally not be hit if called correctly, but as a safeguard:
+            main_filename = f"[1] {file_prefix}.txt"
+            main_file = output_folder / main_filename
+            with open(main_file, 'w', encoding='utf-8') as f:
+                f.write(f"# {chapter_title}\n\n")
+                f.write(text_content)
+            print(f"    Created: {main_filename}")
+            return
+            
+        target_chunk_size = math.ceil(total_len / num_chunks)
+        print(f"    Splitting into {num_chunks} chunks of ~{target_chunk_size} characters.")
+
+        paragraphs = text_content.split('\n\n')
+        
+        chunks = []
+        current_chunk_paras = []
+        current_chunk_len = 0
+        
+        for p in paragraphs:
+            p = p.strip()
+            if not p:
+                continue
+            
+            p_len = len(p)
+            
+            # If the current chunk is not empty and adding the new paragraph would make it too large,
+            # finalize the current chunk.
+            if current_chunk_paras and (current_chunk_len + p_len) > target_chunk_size:
+                chunks.append("\n\n".join(current_chunk_paras))
+                current_chunk_paras = [p]
+                current_chunk_len = p_len
+            else:
+                # Add paragraph to the current chunk
+                current_chunk_paras.append(p)
+                # Add 2 for the '\n\n' that will join them
+                current_chunk_len += p_len + 2
+                
+        # Add the last remaining chunk
+        if current_chunk_paras:
+            chunks.append("\n\n".join(current_chunk_paras))
+            
+        # Save the chunks to files
+        for i, chunk in enumerate(chunks):
+            filename = f"[{i + 1}] {file_prefix}.txt"
+            output_file = output_folder / filename
+            
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(f"# {chapter_title} - Part {i + 1}\n\n")
+                f.write(chunk)
+                
+            print(f"    Created: {filename}")
 
     def create_chapter_text_files(self, chapter_markers):
         """Create text files for each chapter based on navigation markers"""
@@ -765,10 +834,20 @@ class EPUBExtractor:
                     print(f"    Created: {subchapter_filename}")
         else:
             # No subchapters found, create single file
-            print(f"  No subchapters found, creating single file")
             chapter_text = self.html_to_text(combined_html)
             
-            if chapter_text.strip():
+            if not chapter_text.strip():
+                return
+
+            CHUNK_SIZE = 15000
+            CHUNK_SIZE_TOLERANCE = 1.2  # Allow 20% oversize before splitting
+            
+            # If splitting is enabled and text is large enough
+            if self.split_no_subchapters and len(chapter_text) > (CHUNK_SIZE * CHUNK_SIZE_TOLERANCE):
+                self.split_and_save_text(chapter_text, chapter_folder, chapter_folder_name, marker['title'])
+            else:
+                # Default behavior: create a single file for the chapter
+                print(f"  No subchapters found, creating single file.")
                 main_filename = f"[1] {chapter_folder_name}.txt"
                 main_file = chapter_folder / main_filename
                 
@@ -965,7 +1044,7 @@ def find_epub_files(directory, recursive=False):
     
     return sorted(epub_files)
 
-def bulk_extract_epubs(input_dir, output_dir, extract_subchapters=False, show_furigana=False, recursive=False):
+def bulk_extract_epubs(input_dir, output_dir, extract_subchapters=False, show_furigana=False, recursive=False, split_no_subchapters=False):
     """Extract multiple EPUB files from a directory, preserving directory structure"""
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -1012,7 +1091,7 @@ def bulk_extract_epubs(input_dir, output_dir, extract_subchapters=False, show_fu
             epub_output_dir = output_path / epub_folder_name
         
         try:
-            extractor = EPUBExtractor(epub_file, epub_output_dir, extract_subchapters, show_furigana)
+            extractor = EPUBExtractor(epub_file, epub_output_dir, extract_subchapters, show_furigana, split_no_subchapters)
             extractor.extract_chapters()
             successful_extractions += 1
             print(f"✓ Successfully extracted: {epub_file.name}")
@@ -1037,6 +1116,8 @@ def main():
                        help="Output directory (default: extracted_chapters)")
     parser.add_argument("--subchapters", action="store_true",
                        help="Extract subchapters into separate files within chapter folders")
+    parser.add_argument("--split-no-subchapters", action="store_true",
+                        help="When using --subchapters, split chapters with no detected subchapters into smaller files.")
     parser.add_argument("--furigana", action="store_true",
                        help="Show furigana in parentheses format (e.g., 梓川咲太（あずさがわさくた）)")
     parser.add_argument("--bulk", action="store_true",
@@ -1056,10 +1137,10 @@ def main():
                 print(f"Error: Bulk processing requires a directory path, got: {input_path}")
                 return 1
             
-            bulk_extract_epubs(args.epub_path, args.output, args.subchapters, args.furigana, args.recursive)
+            bulk_extract_epubs(args.epub_path, args.output, args.subchapters, args.furigana, args.recursive, args.split_no_subchapters)
         else:
             # Single file/folder processing mode
-            extractor = EPUBExtractor(args.epub_path, args.output, args.subchapters, args.furigana)
+            extractor = EPUBExtractor(args.epub_path, args.output, args.subchapters, args.furigana, args.split_no_subchapters)
             extractor.extract_chapters()
     except Exception as e:
         print(f"Failed to extract EPUB: {e}")
